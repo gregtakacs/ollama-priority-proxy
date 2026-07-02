@@ -264,13 +264,15 @@ def priority_of(model_name):
 
 
 def get_vram_for_model(model_name):
-    """Get VRAM size for a model from config. Returns 0 if unknown."""
+    """Get VRAM size and context length for a model from config. Returns (vram_bytes, ctx_len) tuple."""
     entry = get_model_from_config(model_name)
     if entry:
-        return entry.get("vram_bytes", 0)
-    # Unknown — estimate conservatively (~14 GB as fallback)
+        vram = entry.get("vram_bytes", 0)
+        ctx = entry.get("ctx_len")
+        return vram, ctx
+    # Unknown — estimate conservatively (~14 GB as fallback), no context info
     print(f"[proxy] No measurement for '{model_name}' — assuming ~14 GB.")
-    return 14e9
+    return 14e9, None
 
 
 # ---------------------------------------------------------------------------
@@ -326,16 +328,17 @@ def would_fit(model_name, loaded_models):
     ollama_used = sum(m["size_vram"] for m in loaded_models)
     total_available = get_real_available_vram(ollama_used)  # real free VRAM (gpu_total - baseline - ollama_used)
 
-    measured = get_vram_for_model(model_name)
+    measured, ctx_measured = get_vram_for_model(model_name)
     if measured > 0:
         fits = total_available >= measured
         remaining = total_available - measured
+        ctx_info = f" (ctx={ctx_measured})" if ctx_measured else ""
         if fits:
-            print(f"[fit] '{model_name}' ({measured/1e9:.2f} GB) fits — {remaining/1e9:.2f} GB free after.")
+            print(f"[fit] '{model_name}' ({measured/1e9:.2f} GB) fits — {remaining/1e9:.2f} GB free after.{ctx_info}")
         else:
             needed = measured - total_available
             print(f"[fit] '{model_name}' ({measured/1e9:.2f} GB) does NOT fit — would need {needed/1e9:.2f} GB more. "
-                  f"({format_bytes(remaining)} free of {format_bytes(total_available)} total).")
+                  f"({format_bytes(remaining)} free of {format_bytes(total_available)} total).{ctx_info}")
         return fits
 
     # Shouldn't reach here since get_vram_for_model returns 0 only for truly unknown models,

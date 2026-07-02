@@ -222,10 +222,11 @@ def save_config(config_data, config_path):
         name = m["name"]
         pri = m["priority"]
         vram = format_bytes(m["vram_bytes"])
-        print(f"  [{pri:3d}] {name}: {vram}")
+        ctx_info = f", ctx={m.get('ctx_len', '?')}" if "ctx_len" in m else ""
+        print(f"  [{pri:3d}] {name}: {vram}{ctx_info}")
 
     print(f"\nTo use with the proxy, set:")
-    print(f"  export MEASURED_MODELS_FILE='{config_path}'")
+    print(f"  export MODEL_CONFIG_FILE='{config_path}'")
 
 
 def model_name_to_key(name):
@@ -238,26 +239,27 @@ def model_name_to_key(name):
 # Core Measurement
 # ---------------------------------------------------------------------------
 
-def measure_model(model_name, prompt="test", wait_seconds=5):
+def measure_model(model_name, ctx=262144, prompt="test", wait_seconds=5):
     """Load a model and return its total VRAM usage in bytes.
 
     Args:
         model_name: Full model name with tag (e.g., 'TakacsAI-Coder-256k:latest')
+        ctx: Context length to request when loading the model
         prompt: Short prompt to trigger model loading
         wait_seconds: Seconds to wait for VRAM allocation to settle
 
     Returns:
-        size_vram in bytes, or None on failure.
+        size_vram in bytes and ctx_len from /api/ps, or (None, None) on failure.
     """
     print(f"\n{'='*60}")
-    print(f"Measuring: {model_name}")
+    print(f"Measuring: {model_name} @ ctx={ctx}")
     print(f"{'='*60}")
 
-    # Step 1: Trigger model load via generate API (stream=False for single response)
-    print(f"[1/3] Loading '{model_name}'...")
+    # Step 1: Trigger model load via generate API with requested context length
+    print(f"[1/3] Loading '{model_name}' with num_ctx={ctx}...")
     data = _make_request(
         f"{TARGET_HOST}/api/generate",
-        data=json.dumps({"model": model_name, "prompt": prompt, "stream": False}).encode()
+        data=json.dumps({"model": model_name, "prompt": prompt, "stream": False, "options": {"num_ctx": ctx}}).encode()
     )
     if not data:
         return None
@@ -275,17 +277,20 @@ def measure_model(model_name, prompt="test", wait_seconds=5):
     for m in ps_data["models"]:
         if model_name in m["name"] or m.get("digest", "") == data.get("model_digest", ""):
             size = int(m.get("size_vram", 0))
+            ctx_len = m.get("ctx_len", 0)
             print(f"  ✓ Total VRAM: {size / 1e9:.2f} GB ({size:,} bytes)")
-            return size
+            print(f"  ✓ Context length (ctx_len): {ctx_len}")
+            return size, ctx_len
 
-    # Fallback: use any loaded model's size if name match failed
+    # Fallback: use any loaded model's data if name match failed
     for m in ps_data["models"]:
         size = int(m.get("size_vram", 0))
-        print(f"  ✓ (fallback) Using '{m['name']}': {size / 1e9:.2f} GB")
-        return size
+        ctx_len = m.get("ctx_len", 0)
+        print(f"  ✓ (fallback) Using '{m['name']}': {size / 1e9:.2f} GB, ctx={ctx_len}")
+        return size, ctx_len
 
     print(f"  ✗ Could not find model in loaded list.")
-    return None
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -308,23 +313,25 @@ def interactive_mode(config_path):
         key = model_name_to_key(name_input)
         print(f"\nMeasuring with context={context_len} tokens...")
 
-        size = measure_model(name_input)
-        if size:
+        size, ctx_len = measure_model(name_input, ctx=context_len)
+        if size is not None:
             # Check if already exists — update in place, keep existing priority
             found = False
             for m in config["models"]:
                 if model_name_to_key(m["name"]) == key:
                     m["vram_bytes"] = size
-                    print(f"  Updated '{key}' → {size / 1e9:.2f} GB (priority unchanged)")
+                    m["ctx_len"] = ctx_len
+                    print(f"  Updated '{key}' → {size / 1e9:.2f} GB (ctx={ctx_len})")
                     found = True
                     break
             if not found:
                 config["models"].append({
                     "name": key,
                     "vram_bytes": size,
+                    "ctx_len": ctx_len,
                     "priority": DEFAULT_PRIORITY_NEW_MEASURED
                 })
-                print(f"  Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB")
+                print(f"  Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB (ctx={ctx_len})")
         else:
             print(f"  ✗ Measurement failed for '{name_input}'. Skipping.")
 
@@ -352,23 +359,25 @@ def batch_mode(config_path, output_path):
         print(f"# Measuring: {model_name} (key: '{key}', ctx: {context})")
         print(f"{'#'*60}")
 
-        size = measure_model(model_name, prompt=prompt)
-        if size:
+        size, ctx_len = measure_model(model_name, ctx=context, prompt=prompt)
+        if size is not None:
             # Update or add in unified config
             found = False
             for m in unified["models"]:
                 if model_name_to_key(m["name"]) == key:
                     m["vram_bytes"] = size
-                    print(f"  ✓ Updated '{key}' → {size / 1e9:.2f} GB")
+                    m["ctx_len"] = ctx_len
+                    print(f"  ✓ Updated '{key}' → {size / 1e9:.2f} GB (ctx={ctx_len})")
                     found = True
                     break
             if not found:
                 unified["models"].append({
                     "name": key,
                     "vram_bytes": size,
+                    "ctx_len": ctx_len,
                     "priority": DEFAULT_PRIORITY_NEW_MEASURED
                 })
-                print(f"  ✓ Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB")
+                print(f"  ✓ Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB (ctx={ctx_len})")
         else:
             print(f"  ✗ Failed — skipping.")
 
@@ -384,23 +393,25 @@ def quick_mode(model_name, context, config_path):
     print(f"Quick measure: {model_name} @ {context} tokens")
     print(f"{'='*60}")
 
-    size = measure_model(model_name)
-    if size:
+    size, ctx_len = measure_model(model_name, ctx=context)
+    if size is not None:
         # Update or add
         found = False
         for m in unified["models"]:
             if model_name_to_key(m["name"]) == key:
                 m["vram_bytes"] = size
-                print(f"  Updated '{key}' → {size / 1e9:.2f} GB")
+                m["ctx_len"] = ctx_len
+                print(f"  Updated '{key}' → {size / 1e9:.2f} GB (ctx={ctx_len})")
                 found = True
                 break
         if not found:
             unified["models"].append({
                 "name": key,
                 "vram_bytes": size,
+                "ctx_len": ctx_len,
                 "priority": DEFAULT_PRIORITY_NEW_MEASURED
             })
-            print(f"  Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB")
+            print(f"  Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB (ctx={ctx_len})")
 
         save_config(unified, config_path)
     else:
@@ -479,23 +490,25 @@ def benchmark_all_mode(config_path, ctx=262144, force_recalc=False):
         print(f"# Measuring: {model_name} (key: '{key}', ctx: {ctx})")
         print(f"{'#'*60}")
 
-        size = measure_model(model_name)
-        if size:
+        size, ctx_len = measure_model(model_name, ctx=ctx)
+        if size is not None:
             # Update or add in unified config
             found = False
             for m in unified["models"]:
                 if model_name_to_key(m["name"]) == key:
                     m["vram_bytes"] = size
-                    print(f"  ✓ Updated '{key}' → {size / 1e9:.2f} GB")
+                    m["ctx_len"] = ctx_len
+                    print(f"  ✓ Updated '{key}' → {size / 1e9:.2f} GB (ctx={ctx_len})")
                     found = True
                     break
             if not found:
                 unified["models"].append({
                     "name": key,
                     "vram_bytes": size,
+                    "ctx_len": ctx_len,
                     "priority": DEFAULT_PRIORITY_NEW_MEASURED
                 })
-                print(f"  ✓ Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB")
+                print(f"  ✓ Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB (ctx={ctx_len})")
         else:
             print(f"  ✗ Failed — skipping.")
 
