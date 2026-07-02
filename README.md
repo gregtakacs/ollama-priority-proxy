@@ -61,7 +61,7 @@ The proxy needs a JSON config that maps model names to their actual VRAM usage a
 #### Option A: Measure ALL local models (quickest)
 
 ```bash
-python measure_models.py -a --output ollama_model_registry.json
+python3 measure_models.py -a --output ollama_model_registry.json
 ```
 
 This benchmarks every Ollama model currently installed, skipping ones already measured unless you add `--force`. The default context length is 262144 tokens. Override with `--ctx 8192` if you want a smaller context.
@@ -69,7 +69,7 @@ This benchmarks every Ollama model currently installed, skipping ones already me
 #### Option B: Measure specific models interactively
 
 ```bash
-python measure_models.py -i --output ollama_model_registry.json
+python3 measure_models.py -i --output ollama_model_registry.json
 ```
 
 You'll be prompted for each model name and context length one at a time.
@@ -88,7 +88,7 @@ Create `batch_config.json`:
 
 Then run:
 ```bash
-python measure_models.py --config batch_config.json --output ollama_model_registry.json
+python3 measure_models.py --config batch_config.json --output ollama_model_registry.json
 ```
 
 ### 2. Set Model Priorities
@@ -121,7 +121,7 @@ Priority scale reference:
 ```bash
 # Set the config file path, then start:
 export MODEL_CONFIG_FILE=ollama_model_registry.json
-python OllamaModelProxy.py
+python3 OllamaModelProxy.py
 ```
 
 The proxy listens on **port 8080** by default and forwards to Ollama at `http://localhost:11434`.
@@ -141,8 +141,8 @@ The proxy listens on **port 8080** by default and forwards to Ollama at `http://
 If your Ollama has authentication enabled, set the API key:
 
 ```bash
-export OLLAMA_PROXY_OLLAMA_API_KEY="your-ollama-api-key"
-python OllamaModelProxy.py
+export OLLAMA_PROXY_OLLAMA_API_KEY="<your-real-api-key>"
+python3 OllamaModelProxy.py
 ```
 
 This key is used for:

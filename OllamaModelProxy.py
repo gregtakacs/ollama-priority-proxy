@@ -218,10 +218,30 @@ def load_model_config():
 # Model Resolution Helpers
 # ---------------------------------------------------------------------------
 
+def normalize_model_name(name):
+    """Strip tag suffix from a model name for config lookup.
+
+    E.g., 'TakacsAI-Coder-256k:latest' -> 'takacsai-coder-256k',
+          'qwen3:8b' -> 'qwen3'.
+    """
+    if not name:
+        return ""
+    # Strip tag (everything after ':') and lowercase for comparison
+    base = name.split(":")[0] if ":" in name else name
+    return base.lower()
+
+
 def get_model_from_config(model_name):
-    """Look up a model entry in the config by name. Returns dict or None."""
+    """Look up a model entry in the config by name. Returns dict or None.
+
+    Strips tags before comparison so 'TakacsAI-Coder-256k:latest' matches
+    config entry 'takacsai-coder-256k'.
+    """
+    norm = normalize_model_name(model_name)
+    if not norm:
+        return None
     for m in MODEL_CONFIG.get("models", []):
-        if m["name"].lower() == model_name.lower():
+        if normalize_model_name(m["name"]) == norm:
             return m
     return None
 
