@@ -152,7 +152,13 @@ def get_real_available_vram(loaded_ollama_bytes=None):
     gpu_total = get_gpu_total_bytes()
     baseline = get_gpu_baseline() or 0
     ollama_used = loaded_ollama_bytes or 0
-    return gpu_total - baseline - ollama_used
+    available = gpu_total - baseline - ollama_used
+
+    # Debug logging to trace VRAM calculation
+    print(f"[vram] total={gpu_total/(1024**3):.2f} GB, baseline={baseline/(1024**3):.2f} GB, "
+          f"ollama_used={ollama_used/(1024**3):.2f} GB, available={available/(1024**3):.2f} GB")
+
+    return available
 
 
 def print_gpu_status(loaded_ollama_bytes=None):
