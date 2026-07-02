@@ -268,16 +268,22 @@ def measure_model(model_name, ctx=262144, prompt="test", wait_seconds=5):
 
     Returns:
         size_vram in bytes and ctx_len from /api/ps, or (None, None) on failure.
+
+    Note: Uses keep_alive=-1 to prevent Ollama from auto-evicting the model
+    when subsequent models are measured in a batch run. This ensures accurate
+    VRAM measurements aren't affected by eviction behavior.
     """
     print(f"\n{'='*60}")
     print(f"Measuring: {model_name} @ ctx={ctx}")
     print(f"{'='*60}")
 
-    # Step 1: Trigger model load via generate API with requested context length
+    # Step 1: Trigger model load via generate API with requested context length.
+    # keep_alive=-1 prevents Ollama from auto-evicting the newly loaded model
+    # when subsequent models are measured (VRAM pressure evictions during batch runs).
     print(f"[1/3] Loading '{model_name}' with num_ctx={ctx}...")
     data = _make_request(
         f"{TARGET_HOST}/api/generate",
-        data=json.dumps({"model": model_name, "prompt": prompt, "stream": False, "options": {"num_ctx": ctx}}).encode()
+        data=json.dumps({"model": model_name, "prompt": prompt, "stream": False, "options": {"num_ctx": ctx}, "keep_alive": -1}).encode()
     )
     if not data:
         print(f"  ✗ Failed to load model (API error).")
