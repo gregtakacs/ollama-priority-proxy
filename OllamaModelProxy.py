@@ -314,10 +314,11 @@ def would_fit(model_name, loaded_models):
     Uses pre-measured data from config first; falls back to conservative estimate.
     Accounts for non-Ollama GPU processes via real available VRAM calculation.
 
-    total_available already has baseline and loaded Ollama usage subtracted,
-    so we only need to check if 'measured' fits in the remaining space.
+    The key insight: get_real_available_vram() already subtracts baseline AND loaded Ollama usage,
+    so we only need to check if 'measured' fits in the remaining space — no double subtraction needed.
     """
-    total_available = get_real_available_vram()  # real free VRAM (already excludes baseline + loaded models)
+    ollama_used = sum(m["size_vram"] for m in loaded_models)
+    total_available = get_real_available_vram(ollama_used)  # real free VRAM (gpu_total - baseline - ollama_used)
 
     measured = get_vram_for_model(model_name)
     if measured > 0:
