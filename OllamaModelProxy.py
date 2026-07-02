@@ -457,7 +457,18 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             resp = urlrequest.urlopen(req, timeout=300)
             return resp.read(), resp
         except URLError as e:
-            self._send_error(502, f"Ollama unreachable: {e}")
+            # Pass through the actual HTTP error status and body from Ollama.
+            # For 4xx/5xx responses, the response body contains useful error info.
+            if hasattr(e, 'code') and hasattr(e, 'read'):
+                try:
+                    resp_body = e.read()
+                    code = e.code
+                except Exception:
+                    resp_body = b""
+                    code = 502
+                self._send_error(code, f"Ollama error: {resp_body.decode('utf-8', errors='replace')}")
+            else:
+                self._send_error(502, f"Ollama unreachable: {e}")
             return b"", None
 
     def _forward_streaming(self, method, path, headers):
@@ -470,7 +481,15 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             resp = urlrequest.urlopen(req, timeout=300)
         except URLError as e:
-            self._send_error(502, f"Ollama unreachable: {e}")
+            if hasattr(e, 'code') and hasattr(e, 'read'):
+                code = e.code
+                try:
+                    resp_body = e.read().decode('utf-8', errors='replace')
+                    self._send_error(code, f"Ollama error: {resp_body}")
+                except Exception:
+                    self._send_error(502, f"Ollama unreachable: {e}")
+            else:
+                self._send_error(502, f"Ollama unreachable: {e}")
             return
 
         # Stream SSE events back to client without buffering
