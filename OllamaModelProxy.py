@@ -448,15 +448,10 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
         url = f"{TARGET_HOST}{path}"
         req = urlrequest.Request(url, data=body_bytes, method=method)
 
-        # Pass through all client headers EXCEPT Authorization
+        # Pass through all client headers unchanged — including Authorization.
+        # The proxy's own API key is only used for internal Ollama API calls (e.g., /api/ps).
         for k, v in headers.items():
-            if k.lower() == "authorization":
-                continue  # skip client auth — Ollama handles it directly or we add our own key below
             req.add_header(k, v)
-
-        # Inject proxy's API key if configured (for backend-to-backend calls)
-        if OLLAMA_API_KEY:
-            req.add_header("Authorization", f"Bearer {OLLAMA_API_KEY}")
 
         try:
             resp = urlrequest.urlopen(req, timeout=300)
