@@ -294,47 +294,17 @@ def measure_model(model_name, ctx=262144, prompt="test", wait_seconds=5):
         print(f"  ✗ Failed to read VRAM usage from /api/ps.")
         return None, None
 
-    # Ollama's /api/ps returns: name, model, size, digest, details (parent_model/format/family/families/parameter_size/quantization_level), expires_at, size_vram.
-    # There is NO ctx_len field — we track it ourselves since num_ctx was sent in the request.
+    # Ollama's /api/ps reports size_vram (total VRAM including KV cache) but NOT ctx_len.
+    # We use the requested num_ctx as ctx_len since that IS what was actually used for this measurement.
     for m in ps_data["models"]:
-        # Match by name substring or digest
         if model_name in m.get("name", "") or m.get("digest", "") == data.get("model_digest", ""):
             size = int(m.get("size_vram", 0))
-            print(f"  ✓ Total VRAM: {size / 1e9:.2f} GB ({size:,} bytes)")
-            print(f"  ✓ Context length (requested): {ctx}")
+            print(f"  ✓ Total VRAM (incl. KV cache): {size / 1e9:.2f} GB ({size:,} bytes)")
+            print(f"  ✓ Context length used: {ctx}")
             return size, ctx
 
-    # If the model was evicted before we could read, check if it's still in loaded list
-    # by looking for any model with matching digest from /api/tags
-    target_digest = data.get("model_digest", "")
-    if target_digest:
-        tags_data = _make_request(f"{TARGET_HOST}/api/tags")
-        if tags_data and "models" in tags_data:
-            for m in tags_data["models"]:
-                if m.get("digest", "") == target_digest:
-                    # Model exists but was evicted before measurement — try loading again with longer wait
-                    print(f"  ✗ Model '{model_name}' was evicted before measurement. Re-loading...")
-                    data = _make_request(
-                        f"{TARGET_HOST}/api/generate",
-                        data=json.dumps({"model": model_name, "prompt": prompt, "stream": False, "options": {"num_ctx": ctx}}).encode()
-                    )
-                    if not data:
-                        print(f"  ✗ Failed to re-load model.")
-                        return None, None
-                    time.sleep(8)
-                    ps_data = _make_request(f"{TARGET_HOST}/api/ps")
-                    if ps_data and "models" in ps_data:
-                        for m2 in ps_data["models"]:
-                            if model_name in m2.get("name", "") or m2.get("digest", "") == target_digest:
-                                size = int(m2.get("size_vram", 0))
-                                print(f"  ✓ Total VRAM (re-loaded): {size / 1e9:.2f} GB ({size:,} bytes)")
-                                print(f"  ✓ Context length (requested): {ctx}")
-                                return size, ctx
-                    print(f"  ✗ Still could not measure after reload.")
-                    return None, None
-
-    # Last resort: no model matched — the requested model was evicted before we could read it
-    print(f"  ✗ No matching model found in loaded list. Was evicted before measurement.")
+    # Model was evicted before we could read — shouldn't happen with 5s wait after load
+    print(f"  ✗ Model '{model_name}' evicted before measurement (Ollama auto-evicted).")
     return None, None
 
 
