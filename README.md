@@ -133,7 +133,7 @@ The proxy listens on **port 8080** by default and forwards to Ollama at `http://
 | `OLLAMA_PROXY_LISTEN_PORT` | `8080` | Port the proxy listens on |
 | `OLLAMA_PROXY_TARGET` | `http://localhost:11434` | Target Ollama backend URL |
 | `MODEL_CONFIG_FILE` | `ollama_model_registry.json` | Path to unified config JSON (measurements + priorities) |
-| `OLLAMA_PROXY_OLLAMA_API_KEY` | *(empty)* | **API key for proxy → Ollama backend calls.** Set this if your Ollama instance has authentication enabled. The proxy injects this into all requests sent to the Ollama backend so clients don't need to know about it. |
+| `OLLAMA_PROXY_OLLAMA_API_KEY` | *(empty)* | **API key used by the proxy for its own API calls** (e.g., `/api/ps`, `/api/tags`) and injected into non-streaming requests forwarded to Ollama. Set this only if your Ollama instance requires authentication. Streaming responses do NOT use this key — client `Authorization` headers are passed through unchanged. |
 | `GPU_TOTAL_VRAM_GB` | *(auto-detect)* | Override GPU total VRAM in GB (useful for headless servers) |
 
 #### Using with a locked-down Ollama instance
@@ -145,7 +145,11 @@ export OLLAMA_PROXY_OLLAMA_API_KEY="your-ollama-api-key"
 python OllamaModelProxy.py
 ```
 
-The proxy will use this key for all backend calls to Ollama. Client requests do NOT need to include an `Authorization` header — the proxy handles that transparently.
+This key is used for:
+- The proxy's own internal calls (e.g., `/api/ps`, `/api/tags`) to make routing decisions
+- Non-streaming requests forwarded to the Ollama backend
+
+For streaming responses, client `Authorization` headers are passed through unchanged — so if your Ollama requires auth per-request, clients must still include their own API key.
 
 ### 4. Point Clients at the Proxy
 
