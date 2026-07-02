@@ -348,6 +348,7 @@ def resolve_model(requested, loaded_models):
     """Resolve a requested model name to an actual resident or loadable model.
 
     Algorithm:
+      0. If the requested model is already resident in VRAM → use it directly (no swap needed).
       1. If the requested model would fit in VRAM alongside currently loaded models → use it directly.
          This lets Ollama load/swap to the requested model (it handles eviction if needed).
       2. If it doesn't fit → fall back to the highest-priority model already resident in VRAM.
@@ -358,6 +359,13 @@ def resolve_model(requested, loaded_models):
     """
     if not requested:
         return None  # no model specified — leave alone
+
+    # Step 0: Check if requested model is already resident in VRAM
+    norm_requested = normalize_model_name(requested)
+    for m in loaded_models:
+        if normalize_model_name(m["name"]) == norm_requested:
+            print(f"[route] '{requested}' → use directly (already loaded, {m['size_vram']/(1024**3):.2f} GB).")
+            return requested
 
     # Step 1: Check if requested model fits alongside currently loaded models
     if would_fit(requested, loaded_models):
