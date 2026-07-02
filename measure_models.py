@@ -188,6 +188,24 @@ def get_local_models():
     return [m["name"] for m in data.get("models", [])]
 
 
+# Models known to be embedding-only and don't support /api/generate.
+EMBEDDING_ONLY_MODELS = {
+    "nomic-embed-text",
+    "nomic-b1",
+    "snowflake-arctic-embed",
+    "mxbai-embed-large",
+}
+
+
+def is_embedding_only(model_name):
+    """Check if a model name looks like it's an embedding-only model."""
+    base = model_name.split(":")[0].lower().replace(" ", "-").replace("_", "-")
+    for embed in EMBEDDING_ONLY_MODELS:
+        if embed in base:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Unified Config Helpers
 # ---------------------------------------------------------------------------
@@ -262,7 +280,8 @@ def measure_model(model_name, ctx=262144, prompt="test", wait_seconds=5):
         data=json.dumps({"model": model_name, "prompt": prompt, "stream": False, "options": {"num_ctx": ctx}}).encode()
     )
     if not data:
-        return None
+        print(f"  ✗ Failed to load model (API error).")
+        return None, None
 
     # Step 2: Wait for VRAM to settle
     print(f"[2/3] Waiting {wait_seconds}s for VRAM allocation...")
@@ -272,7 +291,8 @@ def measure_model(model_name, ctx=262144, prompt="test", wait_seconds=5):
     print(f"[3/3] Reading VRAM usage from /api/ps...")
     ps_data = _make_request(f"{TARGET_HOST}/api/ps")
     if not ps_data or "models" not in ps_data:
-        return None
+        print(f"  ✗ Failed to read VRAM usage from /api/ps.")
+        return None, None
 
     for m in ps_data["models"]:
         if model_name in m["name"] or m.get("digest", "") == data.get("model_digest", ""):
@@ -456,7 +476,7 @@ def cleanup_mode(config_path):
     save_config(unified, config_path)
 
 
-def benchmark_all_mode(config_path, ctx=262144, force_recalc=False):
+def benchmark_all_mode(config_path, ctx=262144, force_recalc=False, skip_embedding=True):
     """Benchmark every local Ollama model.
 
     By default only measures models NOT already in the config file.
@@ -485,13 +505,19 @@ def benchmark_all_mode(config_path, ctx=262144, force_recalc=False):
         to_measure = new_models
 
     for model_name in to_measure:
+        if skip_embedding and is_embedding_only(model_name):
+            key = model_name_to_key(model_name)
+            print(f"\nSkipping embedding-only model: {model_name} (key: '{key}')")
+            continue
+
         key = model_name_to_key(model_name)
         print(f"\n{'#'*60}")
         print(f"# Measuring: {model_name} (key: '{key}', ctx: {ctx})")
         print(f"{'#'*60}")
 
-        size, ctx_len = measure_model(model_name, ctx=ctx)
-        if size is not None:
+        result = measure_model(model_name, ctx=ctx)
+        if result and len(result) == 2:
+            size, ctx_len = result
             # Update or add in unified config
             found = False
             for m in unified["models"]:
@@ -534,6 +560,7 @@ def main():
     parser.add_argument("--ctx", type=int, default=262144, help="Context length in tokens (default: 262144)")
     parser.add_argument("-o", "--output", default="ollama_model_registry.json", help="Config file path (default: ollama_model_registry.json)")
     parser.add_argument("-f", "--force", action="store_true", help="Force recalculation of ALL models (use with --all)")
+    parser.add_argument("--no-skip-embeddings", action="store_true", help="Don't skip embedding-only models")
 
     args = parser.parse_args()
 
@@ -546,7 +573,8 @@ def main():
     elif args.model:
         quick_mode(args.model, args.ctx, config_path)
     elif args.benchmark_all:
-        benchmark_all_mode(config_path, ctx=args.ctx, force_recalc=args.force)
+        skip_embeddings = not args.no_skip_embeddings
+        benchmark_all_mode(config_path, ctx=args.ctx, force_recalc=args.force, skip_embedding=skip_embeddings)
     elif args.cleanup:
         cleanup_mode(config_path)
 
