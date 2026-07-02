@@ -3,47 +3,56 @@
     {
       "name": "takacsai-coder-256k",
       "vram_bytes": 26644033043,
-      "priority": 100
+      "priority": 100,
+      "ctx_len": 0
+    },
+    {
+      "name": "qwen3.6-dense-128k",
+      "vram_bytes": 30772706670,
+      "priority": 20,
+      "ctx_len": 0
     },
     {
       "name": "takacsai",
       "vram_bytes": 28780779272,
-      "priority": 20
+      "priority": 20,
+      "ctx_len": 0
     },
     {
       "name": "qwen3.6-moe-256k",
       "vram_bytes": 28780779272,
-      "priority": 20
-    },
-    {
-      "name": "qwen3.6-dense-128k",
-      "vram_bytes": 25040110222,
-      "priority": 20
+      "priority": 20,
+      "ctx_len": 0
     },
     {
       "name": "qwen3.6",
-      "vram_bytes": 23848277768,
-      "priority": 20
+      "vram_bytes": 28780779272,
+      "priority": 20,
+      "ctx_len": 0
     },
     {
       "name": "takacsai-coder-64k",
-      "vram_bytes": 22554597129,
-      "priority": 20
+      "vram_bytes": 26644033043,
+      "priority": 20,
+      "ctx_len": 0
     },
     {
       "name": "ornith",
-      "vram_bytes": 21816399625,
-      "priority": 20
+      "vram_bytes": 26644033043,
+      "priority": 20,
+      "ctx_len": 0
     },
     {
       "name": "gemma4",
-      "vram_bytes": 3473554799,
-      "priority": 20
+      "vram_bytes": 3453610883,
+      "priority": 20,
+      "ctx_len": 0
     },
     {
       "name": "qwen2.5-coder",
-      "vram_bytes": 2115732766,
-      "priority": 20
+      "vram_bytes": 3055256862,
+      "priority": 20,
+      "ctx_len": 0
     }
   ]
 }
