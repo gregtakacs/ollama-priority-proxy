@@ -45,6 +45,11 @@ Setup:
   3. Start proxy:
        export MODEL_CONFIG_FILE=measured_vram.json
        python OllamaModelProxy.py
+
+Context-Aware VRAM Estimation:
+  When the request specifies a num_ctx that differs from the measured ctx, the proxy scales
+  the estimated VRAM proportionally (KV cache scales roughly linearly with context length).
+  This is logged via [ctx] lines so you can compare and verify.
 """
 
 import http.server
@@ -214,7 +219,8 @@ def load_model_config():
             pri = m.get("priority", "?")
             name = m["name"]
             vram = format_bytes(m.get("vram_bytes", 0))
-            print(f"    [{pri:3d}] {name}: {vram}")
+            ctx_info = f" (ctx={m.get('ctx_len', 'N/A')})" if "ctx_len" in m else ""
+            print(f"    [{pri:3d}] {name}: {vram}{ctx_info}")
 
     except (json.JSONDecodeError, OSError) as e:
         print(f"[proxy] WARNING: Failed to load model config: {e}")
@@ -263,6 +269,40 @@ def priority_of(model_name):
     return UNKNOWN_MODEL_PRIORITY
 
 
+def get_request_ctx_from_body(body_bytes):
+    """Extract num_ctx from a request body JSON if present."""
+    try:
+        payload = json.loads(body_bytes)
+        options = payload.get("options", {})
+        return options.get("num_ctx")
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def get_request_ctx_from_url(query_string):
+    """Extract num_ctx from a URL query string if present."""
+    try:
+        import urllib.parse as _urlparse
+        params = _urlparse.parse_qs(_urlparse.urlparse(query_string).query)
+        ctx_list = params.get("num_ctx", [])
+        return int(ctx_list[0]) if ctx_list else None
+    except (ValueError, IndexError):
+        return None
+
+
+def get_request_ctx(body_bytes=None, query_string=""):
+    """Extract num_ctx from either request body or URL query."""
+    if body_bytes:
+        ctx = get_request_ctx_from_body(body_bytes)
+        if ctx is not None:
+            return ctx
+    if query_string:
+        ctx = get_request_ctx_from_url(query_string)
+        if ctx is not None:
+            return ctx
+    return None
+
+
 def get_vram_for_model(model_name):
     """Get VRAM size and context length for a model from config. Returns (vram_bytes, ctx_len) tuple."""
     entry = get_model_from_config(model_name)
@@ -295,7 +335,7 @@ def _make_request(url, data=None):
 def get_loaded_models():
     """Return list of model dicts sorted by VRAM size (largest first).
 
-    Each dict has: name, size_vram (exact bytes incl. KV cache), digest.
+    Each dict has: name, size_vram (exact bytes incl. KV cache), digest, ctx_len.
     Returns empty list on failure with a warning.
     """
     data = _make_request(f"{TARGET_HOST}/api/ps")
@@ -305,40 +345,58 @@ def get_loaded_models():
 
     models = [{
         "name": m["name"],
-        "size_vram": m.get("size_vram", 0),   # exact bytes incl. KV cache
+        "size_vram": int(m.get("size_vram", 0)),   # exact bytes incl. KV cache
         "digest": m.get("digest", ""),
+        "ctx_len": m.get("ctx_len"),                  # loaded context length
     } for m in data.get("models", [])]
 
     return sorted(models, key=lambda x: x["size_vram"], reverse=True)
 
 
 # ---------------------------------------------------------------------------
-# VRAM Fit Check
+# VRAM Fit Check (with context-aware scaling)
 # ---------------------------------------------------------------------------
 
-def would_fit(model_name, loaded_models):
+def would_fit(model_name, loaded_models, request_ctx=None):
     """Check if the requested model would fit alongside currently loaded models.
 
     Uses pre-measured data from config first; falls back to conservative estimate.
     Accounts for non-Ollama GPU processes via real available VRAM calculation.
+    Scales estimated VRAM proportionally to context length ratio when request_ctx differs
+    significantly from measured ctx_len (KV cache scales roughly linearly with context).
 
-    The key insight: get_real_available_vram() already subtracts baseline AND loaded Ollama usage,
-    so we only need to check if 'measured' fits in the remaining space — no double subtraction needed.
+    Returns:
+        True if the model would fit, False otherwise.
     """
     ollama_used = sum(m["size_vram"] for m in loaded_models)
     total_available = get_real_available_vram(ollama_used)  # real free VRAM (gpu_total - baseline - ollama_used)
 
     measured, ctx_measured = get_vram_for_model(model_name)
     if measured > 0:
-        fits = total_available >= measured
-        remaining = total_available - measured
-        ctx_info = f" (ctx={ctx_measured})" if ctx_measured else ""
+        # If context lengths differ significantly, scale the estimate proportionally.
+        adjusted_size = measured
+        if request_ctx is not None and ctx_measured is not None and ctx_measured > 0:
+            ratio = request_ctx / ctx_measured
+            if abs(ratio - 1.0) > 0.05:  # Only adjust if more than 5% different
+                adjusted_size = measured * ratio
+                print(f"[ctx] Requested ctx={request_ctx}, measured ctx={ctx_measured} — "
+                      f"ratio={ratio:.2f}x, adjusting estimate from {measured/1e9:.2f} GB to "
+                      f"{adjusted_size/1e9:.2f} GB")
+
+        fits = total_available >= adjusted_size
+        remaining = total_available - adjusted_size
+        ctx_info = ""
+        if ctx_measured is not None:
+            ctx_info = f" (measured_ctx={ctx_measured}"
+            if request_ctx is not None:
+                ctx_info += f", requested_ctx={request_ctx}"
+            ctx_info += ")"
         if fits:
             print(f"[fit] '{model_name}' ({measured/1e9:.2f} GB) fits — {remaining/1e9:.2f} GB free after.{ctx_info}")
         else:
-            needed = measured - total_available
-            print(f"[fit] '{model_name}' ({measured/1e9:.2f} GB) does NOT fit — would need {needed/1e9:.2f} GB more. "
-                  f"({format_bytes(remaining)} free of {format_bytes(total_available)} total).{ctx_info}")
+            needed = adjusted_size - total_available
+            print(f"[fit] '{model_name}' ({measured/1e9:.2f} GB, est. {adjusted_size/1e9:.2f} GB) "
+                  f"does NOT fit — would need {needed/1e9:.2f} GB more.{ctx_info}")
         return fits
 
     # Shouldn't reach here since get_vram_for_model returns 0 only for truly unknown models,
@@ -353,7 +411,7 @@ def would_fit(model_name, loaded_models):
 # Core Routing Logic (Priority-Based)
 # ---------------------------------------------------------------------------
 
-def resolve_model(requested, loaded_models):
+def resolve_model(requested, loaded_models, request_ctx=None):
     """Resolve a requested model name to an actual resident or loadable model.
 
     Algorithm:
@@ -364,7 +422,13 @@ def resolve_model(requested, loaded_models):
          The proxy will rewrite the request body to point to that resident model instead.
       3. If nothing is loaded at all → pass through unchanged (Ollama loads its default).
 
-    Returns the resolved model name (or alias) to use in the request body.
+    Args:
+        requested: The original model name from the request.
+        loaded_models: List of currently loaded models from /api/ps.
+        request_ctx: Context length from the request (for VRAM estimation).
+
+    Returns:
+        The resolved model name to use in the request body.
     """
     if not requested:
         return None  # no model specified — leave alone
@@ -377,7 +441,7 @@ def resolve_model(requested, loaded_models):
             return requested
 
     # Step 1: Check if requested model fits alongside currently loaded models
-    if would_fit(requested, loaded_models):
+    if would_fit(requested, loaded_models, request_ctx=request_ctx):
         print(f"[route] '{requested}' → use directly (fits in VRAM).")
         return requested
 
@@ -400,6 +464,22 @@ def resolve_model(requested, loaded_models):
 # Body Rewriting Helpers
 # ---------------------------------------------------------------------------
 
+def resolve_and_rewrite(requested, loaded, request_ctx=None):
+    """Resolve a model name and return the final resolved name.
+
+    Args:
+        requested: The original model name from the request.
+        loaded: List of currently loaded models from /api/ps.
+        request_ctx: Context length from the request (for VRAM estimation).
+
+    Returns:
+        Tuple of (final_model_name, was_rewritten) where was_rewritten indicates
+        if the proxy changed the model name (vs passing through unchanged).
+    """
+    final_model = resolve_model(requested, loaded, request_ctx=request_ctx)
+    return final_model, final_model != requested
+
+
 def rewrite_json_body(body_bytes):
     """Parse JSON body, resolve model name via priority routing, return rewritten bytes."""
     try:
@@ -409,9 +489,11 @@ def rewrite_json_body(body_bytes):
 
     loaded = get_loaded_models()
     requested = payload.get("model", "")
-    final_model = resolve_model(requested, loaded)
+    request_ctx = get_request_ctx_from_body(body_bytes)
 
-    if final_model and final_model != requested:
+    final_model, was_rewritten = resolve_and_rewrite(requested, loaded, request_ctx=request_ctx)
+
+    if was_rewritten:
         payload["model"] = final_model
         print(f"[rewrite] '{requested}' -> '{final_model}'")
         return json.dumps(payload).encode()
@@ -432,7 +514,9 @@ def rewrite_streaming_body(body_bytes):
         return body_bytes
 
     loaded = get_loaded_models()
-    final_model = resolve_model(requested, loaded)
+    request_ctx = None  # streaming bodies don't carry options in the response
+
+    final_model = resolve_model(requested, loaded, request_ctx=request_ctx)
 
     if final_model and final_model != requested:
         rewritten_lines = []
