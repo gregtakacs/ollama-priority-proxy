@@ -511,7 +511,7 @@ def benchmark_all_mode(config_path, ctx=262144, force_recalc=False, skip_embeddi
         print(f"{'#'*60}")
 
         result = measure_model(model_name, ctx=ctx)
-        if result and len(result) == 2:
+        if result is not None and len(result) == 2 and result[0] is not None:
             size, ctx_len = result
             # Update or add in unified config
             found = False
