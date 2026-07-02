@@ -1,19 +1,18 @@
-# LLM Tools
+# Ollama Priority Proxy
 
-A collection of tools for working with Large Language Models, including Ollama model registry management and model measurement utilities.
+An Ollama proxy that manages model priority and provides intelligent routing for Large Language Model inference.
 
 ## Files
 
-- `OllamaModelProxy.py` - Proxy for interacting with Ollama models
+- `OllamaModelProxy.py` - Ollama proxy for prioritized model interactions
 - `measure_models.py` - Model measurement utility
 - `ollama_model_registry.json` - Ollama model registry data
 
 ## Setup
 
-1. Install dependencies (if any)
-2. Set up your `.env` file with required environment variables
-3. Run the tools as needed
+1. Set up your `.env` file with required environment variables
+2. Run the tools as needed
 
 ## License
 
-Private
+MIT License — see [LICENSE](LICENSE) for details.
