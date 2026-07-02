@@ -1,33 +1,28 @@
 #!/usr/bin/env python3
 """
-measure_models.py — Measure VRAM usage for Ollama models at specific context lengths.
+measure_models.py — Measure VRAM usage for Ollama models at their native context lengths.
 
-This tool loads each model with its target context and records the exact total
-VRAM (including KV cache) reported by Ollama. The output is a unified JSON file
-containing both measurements AND priority scores used by the proxy for routing.
+This tool queries each model via /api/show to get its designed context_length,
+then measures the exact total VRAM (including KV cache) at that context. If a
+model can't fit at its native ctx, it falls back to successively smaller contexts
+until one works.
+
+The output is a unified JSON file containing measurements AND priority scores
+used by the proxy for routing.
 
 Unified config format:
     {
       "models": [
-        {"name": "TakacsAI-Coder-256k",  "vram_bytes": 27000000000, "priority": 90},
-        {"name": "qwen3:8b",              "vram_bytes": 14000000000, "priority": 50},
-        {"name": "qwen2.5-coder:1.5b-base","vram_bytes":  2000000000, "priority": 30}
+        {"name": "TakacsAI-Coder-256k",  "vram_bytes": 27000000000, "ctx_len": 262144, "priority": 90},
+        {"name": "qwen3:8b",              "vram_bytes": 14000000000, "ctx_len": 32768,  "priority": 50},
+        {"name": "qwen2.5-coder:1.5b-base","vram_bytes":  2000000000, "ctx_len": 4096,   "priority": 30}
       ]
     }
 
 Entries are stored sorted by priority DESC (highest first).
 
 Usage:
-    # Interactive mode — prompts for model names one at a time:
-    python measure_models.py -i --output measured_vram.json
-
-    # Batch mode — measures all models listed in a config:
-    python measure_models.py --config batch_config.json
-
-    # Quick single-model measurement:
-    python measure_models.py --model "TakacsAI-Coder-256k" --ctx 262144
-
-    # Benchmark ALL local Ollama models (skip already measured by default):
+    # Benchmark ALL local Ollama models at their native context lengths:
     python measure_models.py -a --output measured_vram.json
 
     # Force recalculation of all models:
@@ -62,8 +57,12 @@ OLLAMA_API_KEY = os.environ.get("OLLAMA_PROXY_OLLAMA_API_KEY", "")
 DEFAULT_PRIORITY_NEW_MEASURED = 20   # New models get low priority until user bumps them up
 UNKNOWN_MODEL_PRIORITY        = 5   # Models not in config at all get very low priority
 
-# GPU total VRAM in bytes (override if auto-detect fails)
-GPU_TOTAL_VRAM_BYTES = int(os.environ.get("GPU_TOTAL_VRAM_GB", "0")) * (1024 ** 3) if os.environ.get("GPU_TOTAL_VRAM_GB") else None
+# Fallback context lengths to try when native ctx is too large for VRAM.
+# Ordered from largest to smallest — first one that fits wins.
+CTX_FALLBACKS = [131072, 65536, 32768, 16384, 8192, 4096, 2048]
+
+# Default context length for models without a native context_length defined.
+DEFAULT_CTX = 131072  # 128k tokens — reasonable starting point
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +206,50 @@ def is_embedding_only(model_name):
 
 
 # ---------------------------------------------------------------------------
+# Model Context Length Discovery (via /api/show)
+# ---------------------------------------------------------------------------
+
+def get_model_context_length(model_name):
+    """Get the native context length of a model from Ollama's /api/show.
+
+    Queries /api/show and extracts model_info.general.context_length, which is
+    the designed maximum context for that specific model (not an arbitrary value).
+
+    Returns:
+        int — the context length in tokens, or None on failure.
+    """
+    show_data = _make_request(
+        f"{TARGET_HOST}/api/show",
+        data=json.dumps({"model": model_name}).encode()
+    )
+    if not show_data:
+        return None
+
+    # Try model_info.general.context_length first (standard field)
+    model_info = show_data.get("model_info", {})
+    general = model_info.get("general", {})
+    ctx_len_str = str(general.get("context_length", ""))
+
+    if not ctx_len_str or ctx_len_str == "0":
+        # Fallback: check modelfile parameters for num_ctx
+        params_text = show_data.get("parameters", "")
+        if params_text and "num_ctx" in params_text:
+            for line in params_text.strip().split("\n"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "num_ctx":
+                    try:
+                        ctx_len_str = parts[1].strip('"').strip("'")
+                        break
+                    except (ValueError, IndexError):
+                        continue
+
+    try:
+        return int(ctx_len_str)
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Unified Config Helpers
 # ---------------------------------------------------------------------------
 
@@ -239,8 +282,8 @@ def save_config(config_data, config_path):
     for m in models:
         name = m["name"]
         pri = m["priority"]
-        vram = format_bytes(m["vram_bytes"])
-        ctx_info = f", ctx={m.get('ctx_len', '?')}" if "ctx_len" in m else ""
+        vram = format_bytes(m.get("vram_bytes", 0))
+        ctx_info = f" @ {m.get('ctx_len', '?')} tokens" if "ctx_len" in m else ""
         print(f"  [{pri:3d}] {name}: {vram}{ctx_info}")
 
     print(f"\nTo use with the proxy, set:")
@@ -257,187 +300,103 @@ def model_name_to_key(name):
 # Core Measurement
 # ---------------------------------------------------------------------------
 
-def measure_model(model_name, ctx=262144, prompt="test", wait_seconds=5):
-    """Load a model and return its total VRAM usage in bytes.
+def measure_model(model_name):
+    """Measure VRAM usage for a model at its native context length.
+
+    Uses /api/show to get the model's designed context_length, then measures
+    VRAM at that ctx. If it fails (too much VRAM), falls back to successively
+    smaller contexts until one works.
 
     Args:
         model_name: Full model name with tag (e.g., 'TakacsAI-Coder-256k:latest')
-        ctx: Context length to request when loading the model
-        prompt: Short prompt to trigger model loading
-        wait_seconds: Seconds to wait for VRAM allocation to settle
 
     Returns:
-        size_vram in bytes and ctx_len from /api/ps, or (None, None) on failure.
-
-    Note: Uses keep_alive=-1 to prevent Ollama from auto-evicting the model
-    when subsequent models are measured in a batch run. This ensures accurate
-    VRAM measurements aren't affected by eviction behavior.
+        Tuple of (vram_bytes, ctx_len) on success, or (None, None) on failure.
     """
-    print(f"\n{'='*60}")
-    print(f"Measuring: {model_name} @ ctx={ctx}")
-    print(f"{'='*60}")
+    # Step 1: Get the model's native context length from /api/show
+    native_ctx = get_model_context_length(model_name)
+    if native_ctx and native_ctx > 0:
+        print(f"  Native context_length: {native_ctx:,} tokens")
 
-    # Step 1: Trigger model load via generate API with requested context length.
-    # keep_alive=-1 prevents Ollama from auto-evicting the newly loaded model
-    # when subsequent models are measured (VRAM pressure evictions during batch runs).
-    print(f"[1/3] Loading '{model_name}' with num_ctx={ctx}...")
-    data = _make_request(
-        f"{TARGET_HOST}/api/generate",
-        data=json.dumps({"model": model_name, "prompt": prompt, "stream": False, "options": {"num_ctx": ctx}, "keep_alive": -1}).encode()
-    )
-    if not data:
-        print(f"  ✗ Failed to load model (API error).")
-        return None, None
+    # Step 2: Try measuring at native ctx, then fall back to smaller contexts
+    ctxs_to_try = []
+    if native_ctx and native_ctx > 0:
+        ctxs_to_try.append(native_ctx)
+    # Always include the standard fallback chain (in case native is too large or unknown)
+    for fb in CTX_FALLBACKS:
+        if fb not in ctxs_to_try:
+            ctxs_to_try.append(fb)
 
-    # Step 2: Wait for VRAM to settle
-    print(f"[2/3] Waiting {wait_seconds}s for VRAM allocation...")
-    time.sleep(wait_seconds)
+    last_result = None
+    for try_ctx in ctxs_to_try:
+        print(f"\n{'='*60}")
+        print(f"Measuring: {model_name} @ ctx={try_ctx:,} (attempt)")
+        print(f"{'='*60}")
 
-    # Step 3: Read actual total VRAM from /api/ps
-    print(f"[3/3] Reading VRAM usage from /api/ps...")
-    ps_data = _make_request(f"{TARGET_HOST}/api/ps")
-    if not ps_data or "models" not in ps_data:
-        print(f"  ✗ Failed to read VRAM usage from /api/ps.")
-        return None, None
+        # Step 1: Trigger model load via generate API with keep_alive=-1
+        # keep_alive=-1 prevents Ollama from auto-evicting the loaded model
+        # when subsequent models are measured in a batch run.
+        print(f"[1/3] Loading '{model_name}' with num_ctx={try_ctx:,}...")
+        data = _make_request(
+            f"{TARGET_HOST}/api/generate",
+            data=json.dumps({
+                "model": model_name,
+                "prompt": "test",
+                "stream": False,
+                "options": {"num_ctx": try_ctx},
+                "keep_alive": -1
+            }).encode()
+        )
 
-    # Ollama's /api/ps reports size_vram (total VRAM including KV cache) but NOT ctx_len.
-    # We use the requested num_ctx as ctx_len since that IS what was actually used for this measurement.
-    for m in ps_data["models"]:
-        if model_name in m.get("name", "") or m.get("digest", "") == data.get("model_digest", ""):
-            size = int(m.get("size_vram", 0))
-            print(f"  ✓ Total VRAM (incl. KV cache): {size / 1e9:.2f} GB ({size:,} bytes)")
-            print(f"  ✓ Context length used: {ctx}")
-            return size, ctx
+        if not data:
+            print(f"  ✗ Failed to load at ctx={try_ctx:,} (API error). Trying next...")
+            last_result = None
+            continue
 
-    # Model was evicted before we could read — shouldn't happen with 5s wait after load
-    print(f"  ✗ Model '{model_name}' evicted before measurement (Ollama auto-evicted).")
-    return None, None
+        # Step 2: Wait for VRAM to settle
+        print(f"[2/3] Waiting 5s for VRAM allocation...")
+        time.sleep(5)
+
+        # Step 3: Read actual total VRAM from /api/ps
+        print(f"[3/3] Reading VRAM usage from /api/ps...")
+        ps_data = _make_request(f"{TARGET_HOST}/api/ps")
+        if not ps_data or "models" not in ps_data:
+            print(f"  ✗ Failed to read VRAM from /api/ps. Trying next ctx...")
+            last_result = None
+            continue
+
+        # Ollama's /api/ps reports size_vram (total VRAM including KV cache) but NOT ctx_len.
+        # The ctx we used IS what was actually configured for this measurement.
+        matched = False
+        for m in ps_data["models"]:
+            if model_name in m.get("name", "") or m.get("digest", "") == data.get("model_digest", ""):
+                size = int(m.get("size_vram", 0))
+                print(f"  ✓ Total VRAM (incl. KV cache): {size / 1e9:.2f} GB ({size:,} bytes)")
+                print(f"  ✓ Context length used: {try_ctx:,}")
+                last_result = (size, try_ctx)
+
+                # If this was the native ctx, we're done — no need to fall back further.
+                if try_ctx == native_ctx:
+                    return size, try_ctx
+                matched = True
+                break
+
+        if not matched and last_result is None:
+            print(f"  ✗ Model evicted before measurement at ctx={try_ctx:,}. Trying next...")
+        elif last_result is not None:
+            # Successfully measured at a fallback ctx — report it but don't try further.
+            print(f"  ✓ Measured at fallback ctx={try_ctx:,} (native was {native_ctx or '?'})")
+            return size, try_ctx
+
+    # All attempts exhausted
+    if last_result is None:
+        print(f"\n✗ Failed to measure '{model_name}' — all context lengths too large for VRAM.")
+    return last_result
 
 
 # ---------------------------------------------------------------------------
 # Modes
 # ---------------------------------------------------------------------------
-
-def interactive_mode(config_path):
-    """Interactive mode: prompts for model names one at a time."""
-    config = load_config(config_path)
-
-    while True:
-        print("\n--- Measure Models ---")
-        name_input = input("Model name (e.g., 'TakacsAI-Coder-256k:latest') or 'done': ").strip()
-        if name_input.lower() in ("done", "exit", ""):
-            break
-
-        ctx_input = input(f"Context length for '{name_input}' [default: 262144]: ").strip()
-        context_len = int(ctx_input) if ctx_input else 262144
-
-        key = model_name_to_key(name_input)
-        print(f"\nMeasuring with context={context_len} tokens...")
-
-        size, ctx_len = measure_model(name_input, ctx=context_len)
-        if size is not None:
-            # Check if already exists — update in place, keep existing priority
-            found = False
-            for m in config["models"]:
-                if model_name_to_key(m["name"]) == key:
-                    m["vram_bytes"] = size
-                    m["ctx_len"] = ctx_len
-                    print(f"  Updated '{key}' → {size / 1e9:.2f} GB (ctx={ctx_len})")
-                    found = True
-                    break
-            if not found:
-                config["models"].append({
-                    "name": key,
-                    "vram_bytes": size,
-                    "ctx_len": ctx_len,
-                    "priority": DEFAULT_PRIORITY_NEW_MEASURED
-                })
-                print(f"  Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB (ctx={ctx_len})")
-        else:
-            print(f"  ✗ Measurement failed for '{name_input}'. Skipping.")
-
-    save_config(config, config_path)
-
-
-def batch_mode(config_path, output_path):
-    """Batch mode: measures all models from a config file."""
-    try:
-        with open(config_path) as f:
-            batch_cfg = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"[error] Failed to load config '{config_path}': {e}", file=sys.stderr)
-        sys.exit(1)
-
-    unified = load_config(output_path)
-
-    for entry in batch_cfg.get("models", []):
-        model_name = entry["model"]
-        key = entry.get("alias", model_name_to_key(model_name))
-        context = entry.get("context", 262144)
-        prompt = entry.get("prompt", "test")
-
-        print(f"\n{'#'*60}")
-        print(f"# Measuring: {model_name} (key: '{key}', ctx: {context})")
-        print(f"{'#'*60}")
-
-        size, ctx_len = measure_model(model_name, ctx=context, prompt=prompt)
-        if size is not None:
-            # Update or add in unified config
-            found = False
-            for m in unified["models"]:
-                if model_name_to_key(m["name"]) == key:
-                    m["vram_bytes"] = size
-                    m["ctx_len"] = ctx_len
-                    print(f"  ✓ Updated '{key}' → {size / 1e9:.2f} GB (ctx={ctx_len})")
-                    found = True
-                    break
-            if not found:
-                unified["models"].append({
-                    "name": key,
-                    "vram_bytes": size,
-                    "ctx_len": ctx_len,
-                    "priority": DEFAULT_PRIORITY_NEW_MEASURED
-                })
-                print(f"  ✓ Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB (ctx={ctx_len})")
-        else:
-            print(f"  ✗ Failed — skipping.")
-
-    save_config(unified, output_path)
-
-
-def quick_mode(model_name, context, config_path):
-    """Quick single-model measurement."""
-    key = model_name_to_key(model_name)
-    unified = load_config(config_path)
-
-    print(f"\n{'='*60}")
-    print(f"Quick measure: {model_name} @ {context} tokens")
-    print(f"{'='*60}")
-
-    size, ctx_len = measure_model(model_name, ctx=context)
-    if size is not None:
-        # Update or add
-        found = False
-        for m in unified["models"]:
-            if model_name_to_key(m["name"]) == key:
-                m["vram_bytes"] = size
-                m["ctx_len"] = ctx_len
-                print(f"  Updated '{key}' → {size / 1e9:.2f} GB (ctx={ctx_len})")
-                found = True
-                break
-        if not found:
-            unified["models"].append({
-                "name": key,
-                "vram_bytes": size,
-                "ctx_len": ctx_len,
-                "priority": DEFAULT_PRIORITY_NEW_MEASURED
-            })
-            print(f"  Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB (ctx={ctx_len})")
-
-        save_config(unified, config_path)
-    else:
-        print("Measurement failed.")
-
 
 def cleanup_mode(config_path):
     """Remove entries for models that no longer exist locally."""
@@ -471,14 +430,14 @@ def cleanup_mode(config_path):
 
     print(f"\nRemoved {len(removed)} stale entry/entries:")
     for m in removed:
-        print(f"  ✗ {m['name']} ({format_bytes(m['vram_bytes'])})")
+        print(f"  ✗ {m['name']} ({format_bytes(m.get('vram_bytes', 0))})")
 
     unified["models"] = kept
     save_config(unified, config_path)
 
 
-def benchmark_all_mode(config_path, ctx=262144, force_recalc=False, skip_embedding=True):
-    """Benchmark every local Ollama model.
+def benchmark_all_mode(config_path, force_recalc=False):
+    """Benchmark every local Ollama model at its native context length.
 
     By default only measures models NOT already in the config file.
     Use --force to recalculate all entries even if they exist.
@@ -495,7 +454,7 @@ def benchmark_all_mode(config_path, ctx=262144, force_recalc=False, skip_embeddi
 
     if force_recalc:
         to_measure = available
-        print("Force recalc mode — measuring ALL models.")
+        print("Force recalc mode — measuring ALL models at their native context lengths.")
     else:
         # Only measure models not already in the config
         new_models = [m for m in available if model_name_to_key(m) not in measured_keys]
@@ -506,18 +465,20 @@ def benchmark_all_mode(config_path, ctx=262144, force_recalc=False, skip_embeddi
         to_measure = new_models
 
     for model_name in to_measure:
-        if skip_embedding and is_embedding_only(model_name):
+        if is_embedding_only(model_name):
             key = model_name_to_key(model_name)
             print(f"\nSkipping embedding-only model: {model_name} (key: '{key}')")
             continue
 
         key = model_name_to_key(model_name)
+        native_ctx = get_model_context_length(model_name)
+        native_info = f" (native ctx={native_ctx:,})" if native_ctx and native_ctx > 0 else " (unknown native ctx)"
         print(f"\n{'#'*60}")
-        print(f"# Measuring: {model_name} (key: '{key}', ctx: {ctx})")
+        print(f"# Measuring: {model_name}{native_info} (key: '{key}')")
         print(f"{'#'*60}")
 
-        result = measure_model(model_name, ctx=ctx)
-        if result is not None and len(result) == 2 and result[0] is not None:
+        result = measure_model(model_name)
+        if result and len(result) == 2 and result[0] is not None:
             size, ctx_len = result
             # Update or add in unified config
             found = False
@@ -525,7 +486,7 @@ def benchmark_all_mode(config_path, ctx=262144, force_recalc=False, skip_embeddi
                 if model_name_to_key(m["name"]) == key:
                     m["vram_bytes"] = size
                     m["ctx_len"] = ctx_len
-                    print(f"  ✓ Updated '{key}' → {size / 1e9:.2f} GB (ctx={ctx_len})")
+                    print(f"  ✓ Updated '{key}' → {size / 1e9:.2f} GB @ {ctx_len:,} tokens")
                     found = True
                     break
             if not found:
@@ -535,7 +496,7 @@ def benchmark_all_mode(config_path, ctx=262144, force_recalc=False, skip_embeddi
                     "ctx_len": ctx_len,
                     "priority": DEFAULT_PRIORITY_NEW_MEASURED
                 })
-                print(f"  ✓ Added '{key}' with default priority {DEFAULT_PRIORITY_NEW_MEASURED} → {size / 1e9:.2f} GB (ctx={ctx_len})")
+                print(f"  ✓ Added '{key}' → {size / 1e9:.2f} GB @ {ctx_len:,} tokens (pri={DEFAULT_PRIORITY_NEW_MEASURED})")
         else:
             print(f"  ✗ Failed — skipping.")
 
@@ -548,34 +509,26 @@ def benchmark_all_mode(config_path, ctx=262144, force_recalc=False, skip_embeddi
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Measure VRAM usage for Ollama models at specific context lengths."
+        description="Measure VRAM usage for Ollama models at their native context lengths."
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--model", help="Single model name to measure (e.g., 'TakacsAI-Coder-256k:latest')")
-    group.add_argument("--config", help="Path to JSON batch config file")
-    group.add_argument("-i", "--interactive", action="store_true", help="Interactive mode — prompts for models one at a time")
-    group.add_argument("-a", "--all", dest="benchmark_all", action="store_true", help="Benchmark ALL local Ollama models (skip already measured by default)")
-    group.add_argument("--cleanup", action="store_true", help="Remove stale entries from config file for models no longer available")
+    group.add_argument("-a", "--all", dest="benchmark_all", action="store_true",
+                       help="Benchmark ALL local Ollama models at their native context lengths")
+    group.add_argument("--cleanup", action="store_true",
+                       help="Remove stale entries from config file for models no longer available")
 
-    parser.add_argument("--ctx", type=int, default=262144, help="Context length in tokens (default: 262144)")
-    parser.add_argument("-o", "--output", default="ollama_model_registry.json", help="Config file path (default: ollama_model_registry.json)")
-    parser.add_argument("-f", "--force", action="store_true", help="Force recalculation of ALL models (use with --all)")
-    parser.add_argument("--no-skip-embeddings", action="store_true", help="Don't skip embedding-only models")
+    parser.add_argument("-o", "--output", default="ollama_model_registry.json",
+                        help="Config file path (default: ollama_model_registry.json)")
+    parser.add_argument("-f", "--force", action="store_true",
+                        help="Force recalculation of ALL models (use with --all)")
 
     args = parser.parse_args()
 
-    config_path = args.output or "measured_vram.json"
+    config_path = args.output or "ollama_model_registry.json"
 
-    if args.interactive:
-        interactive_mode(config_path)
-    elif args.config:
-        batch_mode(args.config, config_path)
-    elif args.model:
-        quick_mode(args.model, args.ctx, config_path)
-    elif args.benchmark_all:
-        skip_embeddings = not args.no_skip_embeddings
-        benchmark_all_mode(config_path, ctx=args.ctx, force_recalc=args.force, skip_embedding=skip_embeddings)
+    if args.benchmark_all:
+        benchmark_all_mode(config_path, force_recalc=args.force)
     elif args.cleanup:
         cleanup_mode(config_path)
 
