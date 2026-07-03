@@ -230,16 +230,33 @@ def load_model_config():
 # Model Resolution Helpers
 # ---------------------------------------------------------------------------
 
-def normalize_model_name(name):
-    """Strip tag suffix from a model name for config lookup.
+def normalize_model_name(name, strip_version=True):
+    """Normalize a model name for config lookup.
 
-    E.g., 'TakacsAI-Coder-256k:latest' -> 'takacsai-coder-256k',
-          'qwen3:8b' -> 'qwen3'.
+    Args:
+        name: Full model name (e.g., 'qwen3.5:something')
+        strip_version: If True, also strips version-like suffixes from the base name
+                      so that similar models with different tags don't collide.
+                      E.g., 'qwen3.5:something' -> 'qwen3', keeping enough distinction
+                      for config lookup while preventing duplicate entries when multiple
+                      versions of a model exist.
+
+    Returns:
+        Normalized name (lowercase, with optional version stripping).
     """
     if not name:
         return ""
     # Strip tag (everything after ':') and lowercase for comparison
     base = name.split(":")[0] if ":" in name else name
+
+    if strip_version:
+        import re
+        # Remove trailing version-like suffixes from the base name
+        # This prevents qwen3.5:something and qwen3.5:another from becoming duplicates
+        base = re.sub(r'[vV]\d+(\.\d+)*$', '', base)  # Remove :v1, :v2.0 etc
+        base = re.sub(r'[-_][a-zA-Z]+$', '', base)  # Remove -beta, _dev etc
+        base = re.sub(r'\s+', '_', base)  # Normalize whitespace
+
     return base.lower()
 
 
@@ -247,14 +264,24 @@ def get_model_from_config(model_name):
     """Look up a model entry in the config by name. Returns dict or None.
 
     Strips tags before comparison so 'TakacsAI-Coder-256k:latest' matches
-    config entry 'takacsai-coder-256k'.
+    config entry 'takacsai-coder-256k'. Falls back to fuzzy prefix match
+    for models with similar names but different tags (e.g., qwen3.5 variants).
     """
     norm = normalize_model_name(model_name)
     if not norm:
         return None
+
+    # Exact match first
     for m in MODEL_CONFIG.get("models", []):
         if normalize_model_name(m["name"]) == norm:
             return m
+
+    # Fallback: prefix match (e.g., 'qwen3.5' matches 'qwen3.5-something')
+    for m in MODEL_CONFIG.get("models", []):
+        config_norm = normalize_model_name(m["name"], strip_version=False)
+        if norm.startswith(config_norm) or config_norm.startswith(norm):
+            return m
+
     return None
 
 
@@ -417,10 +444,10 @@ def resolve_model(requested, loaded_models, request_ctx=None):
     Algorithm:
       0. If the requested model is already resident in VRAM → use it directly (no swap needed).
       1. If the requested model would fit in VRAM alongside currently loaded models → use it directly.
-         This lets Ollama load/swap to the requested model (it handles eviction if needed).
-      2. If it doesn't fit → fall back to the highest-priority model already resident in VRAM.
-         The proxy will rewrite the request body to point to that resident model instead.
-      3. If nothing is loaded at all → pass through unchanged (Ollama loads its default).
+          This lets Ollama load/swap to the requested model (it handles eviction if needed).
+      2. If it doesn't fit and a resident has higher priority than the request → reroute to that resident.
+         The proxy will rewrite the request body to point to the highest-priority resident instead.
+      3. If nothing is loaded, or no resident beats the request's priority → pass through unchanged.
 
     Args:
         requested: The original model name from the request.
@@ -445,18 +472,27 @@ def resolve_model(requested, loaded_models, request_ctx=None):
         print(f"[route] '{requested}' → use directly (fits in VRAM).")
         return requested
 
-    # Step 2: Doesn't fit — find highest-priority resident model to fall back on
+    # Step 2: Doesn't fit — check resident priorities.
+    #         If any resident has higher priority than the request, reroute to the best one.
     if not loaded_models:
         print("[route] Nothing is loaded. Pass-through unchanged; Ollama will load its default.")
-        return requested  # pass through; Ollama handles loading
+        return requested
 
-    # Sort loaded models by priority DESC, then VRAM size DESC (tiebreaker)
-    best = max(loaded_models, key=lambda m: (priority_of(m["name"]), m["size_vram"]))
+    req_pri = priority_of(requested)
+
+    # Find residents with strictly higher priority than the request.
+    candidates = [m for m in loaded_models if priority_of(m["name"]) > req_pri]
+    if not candidates:
+        # No resident beats the request — let Ollama handle it (pass through).
+        print(f"[route] '{requested}' doesn't fit and no resident has higher priority. "
+              f"Pass-through unchanged; Ollama will handle eviction.")
+        return requested
+
+    best = max(candidates, key=lambda m: (priority_of(m["name"]), m["size_vram"]))
     pri = priority_of(best["name"])
     vram_gb = best["size_vram"] / (1024 ** 3)
-
     print(f"[route] '{requested}' doesn't fit. "
-          f"Falling back to highest-priority resident: '{best['name']}' (pri={pri}, {vram_gb:.2f} GB).")
+          f"Rerouting to higher-priority resident: '{best['name']}' (pri={pri}, {vram_gb:.2f} GB).")
     return best["name"]
 
 

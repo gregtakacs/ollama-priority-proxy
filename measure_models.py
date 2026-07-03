@@ -291,9 +291,14 @@ def save_config(config_data, config_path):
 
 
 def model_name_to_key(name):
-    """Convert a full Ollama model name to a config key (lowercase, no tag)."""
-    base = name.split(":")[0] if ":" in name else name
-    return base.lower().replace(" ", "-").replace("_", "-")
+    """Convert a full Ollama model name to a config key (lowercase, with tag preserved for uniqueness)."""
+    # Keep the full model name (with tag) but lowercase it and normalize separators.
+    # This prevents qwen3.5:something and qwen3.5:another from colliding as duplicates.
+    if ":" in name:
+        base, tag = name.split(":", 1)
+        return f"{base.lower().replace(' ', '-').replace('_', '-')}-{tag.lower().replace(' ', '-').replace('_', '-')}"
+    else:
+        return name.lower().replace(" ", "-").replace("_", "-")
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +469,8 @@ def benchmark_all_mode(config_path, force_recalc=False):
         print(f"  Skipping:  {skip_count} (already in config)")
         to_measure = new_models
 
+    fallback_models = []  # Track models measured at fallback ctx (no native ctx defined)
+
     for model_name in to_measure:
         if is_embedding_only(model_name):
             key = model_name_to_key(model_name)
@@ -472,7 +479,8 @@ def benchmark_all_mode(config_path, force_recalc=False):
 
         key = model_name_to_key(model_name)
         native_ctx = get_model_context_length(model_name)
-        native_info = f" (native ctx={native_ctx:,})" if native_ctx and native_ctx > 0 else " (unknown native ctx)"
+        has_native = bool(native_ctx and native_ctx > 0)
+        native_info = f" (native ctx={native_ctx:,})" if has_native else " (no native ctx — will use fallback)"
         print(f"\n{'#'*60}")
         print(f"# Measuring: {model_name}{native_info} (key: '{key}')")
         print(f"{'#'*60}")
@@ -480,6 +488,9 @@ def benchmark_all_mode(config_path, force_recalc=False):
         result = measure_model(model_name)
         if result and len(result) == 2 and result[0] is not None:
             size, ctx_len = result
+            # Track whether this model was measured at fallback ctx (no native defined)
+            was_fallback = not has_native
+
             # Update or add in unified config
             found = False
             for m in unified["models"]:
@@ -497,10 +508,19 @@ def benchmark_all_mode(config_path, force_recalc=False):
                     "priority": DEFAULT_PRIORITY_NEW_MEASURED
                 })
                 print(f"  ✓ Added '{key}' → {size / 1e9:.2f} GB @ {ctx_len:,} tokens (pri={DEFAULT_PRIORITY_NEW_MEASURED})")
+
+            if was_fallback:
+                fallback_models.append(key)
         else:
             print(f"  ✗ Failed — skipping.")
 
     save_config(unified, config_path)
+
+    # Report models measured at fallback context length
+    if fallback_models:
+        print(f"\n⚠ {len(fallback_models)} model(s) were measured at fallback ctx=128k (no native context_length defined):")
+        for key in fallback_models:
+            print(f"  • {key}")
 
 
 # ---------------------------------------------------------------------------
