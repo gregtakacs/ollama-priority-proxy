@@ -28,3 +28,6 @@ Thumbs.db
 
 # Project-specific
 *.log
+
+# Runtime config (generated per-deployment)
+ollama_model_registry.json
