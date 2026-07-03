@@ -64,7 +64,7 @@ The proxy needs a JSON config that maps model names to their actual VRAM usage a
 python3 measure_models.py -a --output ollama_model_registry.json
 ```
 
-This benchmarks every Ollama model currently installed, skipping ones already measured unless you add `--force`. The default context length is 262144 tokens. Override with `--ctx 8192` if you want a smaller context.
+This benchmarks every Ollama model currently installed, skipping ones already measured unless you add `--force`. The default context length is **131072** (128k) tokens. Use `--use-default-ctx` to let each model use its own native default context length instead of forcing a fixed value — recommended for accurate VRAM measurements that match real-world usage via WebUI or CLI.
 
 #### Option B: Measure specific models interactively
 
@@ -183,22 +183,20 @@ Replace your Ollama endpoint with the proxy:
 
 ### Using with a locked-down Ollama instance
 
-If your Ollama has authentication enabled, set the API key:
+If your Ollama has authentication enabled, set the proxy's API key:
 
 ```bash
 # Direct Python — plain env var
 export OLLAMA_PROXY_OLLAMA_API_KEY="<your-api-key>"
 python3 OllamaModelProxy.py
 
-# Docker — via secrets file
+# Docker — via secrets file (recommended)
 docker run -e OLLAMA_PROXY_OLLAMA_API_KEY_FILE=/run/secrets/ollama_token ...
 ```
 
-This key is used for:
-- The proxy's own internal calls (e.g., `/api/ps`, `/api/tags`) to make routing decisions
-- Non-streaming requests forwarded to the Ollama backend
+This key is used **only** for the proxy's own internal calls to Ollama (e.g., `/api/ps`, `/api/tags`) — these are requests the proxy makes to gather routing information. It is **not** added to client requests forwarded through the proxy.
 
-For streaming responses, client `Authorization` headers are passed through unchanged — so if your Ollama requires auth per-request, clients must still include their own API key.
+Forwarded requests (both streaming and non-streaming) pass through whatever `Authorization` header the **client** provides. So if your Ollama requires per-request authentication, clients must include their own API key in their request headers — the proxy does not inject or override it.
 
 ## Intercepted Endpoints
 
