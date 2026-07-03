@@ -71,7 +71,19 @@ TARGET_HOST = os.environ.get("OLLAMA_PROXY_TARGET", "http://localhost:11434").rs
 MODEL_CONFIG_FILE = os.environ.get("MODEL_CONFIG_FILE", "ollama_model_registry.json")
 
 # API key for proxy → Ollama backend calls (if Ollama has auth enabled)
-OLLAMA_API_KEY = os.environ.get("OLLAMA_PROXY_OLLAMA_API_KEY", "")
+# Supports _FILE variant for Docker secrets: e.g. OLLAMA_PROXY_OLLAMA_API_KEY_FILE=/run/secrets/ollama_api_key
+def _read_secret_file(key_env_var):
+    """Read a value from a file path specified by a *_FILE env var."""
+    file_path = os.environ.get(f"{key_env_var}_FILE", "")
+    if file_path:
+        try:
+            with open(file_path) as f:
+                return f.read().strip()
+        except OSError as e:
+            print(f"[proxy] WARNING: Failed to read secret from {file_path}: {e}")
+    return os.environ.get(key_env_var, "")
+
+OLLAMA_API_KEY = _read_secret_file("OLLAMA_PROXY_OLLAMA_API_KEY")
 
 # Default priority for unknown models not in config
 UNKNOWN_MODEL_PRIORITY = 5
