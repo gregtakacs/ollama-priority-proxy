@@ -192,6 +192,21 @@ def print_gpu_status(loaded_ollama_bytes=None):
 MODEL_CONFIG = {"models": []}  # loaded at startup from MODEL_CONFIG_FILE
 
 
+def _model_name_to_key(name):
+    """Convert a full Ollama model name to its config key format.
+
+    This mirrors the normalization in measure_models.py so request names match config entries.
+    E.g., 'TakacsAI-Coder-256k:latest' -> 'takacsai-coder-256k-latest'
+
+    Config keys preserve the tag as a suffix (lowercased, normalized) for uniqueness.
+    """
+    if ":" in name:
+        base, tag = name.split(":", 1)
+        return f"{base.lower().replace(' ', '-').replace('_', '-')}-{tag.lower().replace(' ', '-').replace('_', '-')}"
+    else:
+        return name.lower().replace(" ", "-").replace("_", "-")
+
+
 def load_model_config():
     """Load unified config file (measurements + priorities)."""
     global MODEL_CONFIG
@@ -201,11 +216,21 @@ def load_model_config():
 
     try:
         with open(MODEL_CONFIG_FILE) as f:
-            data = json.load(f)
+            content = f.read()
+        if not content.strip():
+            print(f"[proxy] WARNING: Model config file is empty '{MODEL_CONFIG_FILE}' — treating as empty.")
+            MODEL_CONFIG = {"models": []}
+            return
+        data = json.loads(content)
         if "models" not in data:
             print(f"[proxy] WARNING: Config missing 'models' key — treating as empty.")
             MODEL_CONFIG = {"models": []}
             return
+
+        # Normalize all model names using the same format as measure_models.py.
+        for m in data["models"]:
+            if "name" in m:
+                m["name"] = _model_name_to_key(m["name"])
 
         MODEL_CONFIG = data
         # Sort by priority DESC, then vram_bytes DESC (file should already be sorted)
@@ -230,56 +255,26 @@ def load_model_config():
 # Model Resolution Helpers
 # ---------------------------------------------------------------------------
 
-def normalize_model_name(name, strip_version=True):
-    """Normalize a model name for config lookup.
-
-    Args:
-        name: Full model name (e.g., 'qwen3.5:something')
-        strip_version: If True, also strips version-like suffixes from the base name
-                      so that similar models with different tags don't collide.
-                      E.g., 'qwen3.5:something' -> 'qwen3', keeping enough distinction
-                      for config lookup while preventing duplicate entries when multiple
-                      versions of a model exist.
-
-    Returns:
-        Normalized name (lowercase, with optional version stripping).
-    """
+def _model_to_key(name):
+    """Normalize a model name to its config key format (same as measure_models.py)."""
     if not name:
         return ""
-    # Strip tag (everything after ':') and lowercase for comparison
-    base = name.split(":")[0] if ":" in name else name
-
-    if strip_version:
-        import re
-        # Remove trailing version-like suffixes from the base name
-        # This prevents qwen3.5:something and qwen3.5:another from becoming duplicates
-        base = re.sub(r'[vV]\d+(\.\d+)*$', '', base)  # Remove :v1, :v2.0 etc
-        base = re.sub(r'[-_][a-zA-Z]+$', '', base)  # Remove -beta, _dev etc
-        base = re.sub(r'\s+', '_', base)  # Normalize whitespace
-
-    return base.lower()
+    return _model_name_to_key(name)
 
 
 def get_model_from_config(model_name):
     """Look up a model entry in the config by name. Returns dict or None.
 
-    Strips tags before comparison so 'TakacsAI-Coder-256k:latest' matches
-    config entry 'takacsai-coder-256k'. Falls back to fuzzy prefix match
-    for models with similar names but different tags (e.g., qwen3.5 variants).
+    Normalizes both request and config names using _model_name_to_key so that
+    'TakacsAI-Coder-256k:latest' matches config entry 'takacsai-coder-256k-latest'.
     """
-    norm = normalize_model_name(model_name)
+    norm = _model_to_key(model_name)
     if not norm:
         return None
 
-    # Exact match first
+    # Exact match (both sides use the same normalization).
     for m in MODEL_CONFIG.get("models", []):
-        if normalize_model_name(m["name"]) == norm:
-            return m
-
-    # Fallback: prefix match (e.g., 'qwen3.5' matches 'qwen3.5-something')
-    for m in MODEL_CONFIG.get("models", []):
-        config_norm = normalize_model_name(m["name"], strip_version=False)
-        if norm.startswith(config_norm) or config_norm.startswith(norm):
+        if _model_to_key(m["name"]) == norm:
             return m
 
     return None
@@ -461,9 +456,9 @@ def resolve_model(requested, loaded_models, request_ctx=None):
         return None  # no model specified — leave alone
 
     # Step 0: Check if requested model is already resident in VRAM
-    norm_requested = normalize_model_name(requested)
+    norm_requested = _model_to_key(requested)
     for m in loaded_models:
-        if normalize_model_name(m["name"]) == norm_requested:
+        if _model_to_key(m["name"]) == norm_requested:
             print(f"[route] '{requested}' → use directly (already loaded, {m['size_vram']/(1024**3):.2f} GB).")
             return requested
 

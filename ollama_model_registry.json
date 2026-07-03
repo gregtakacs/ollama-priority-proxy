@@ -1,37 +1,43 @@
 {
   "models": [
     {
-      "name": "takacsai-coder-256k",
+      "name": "takacsai-coder-256k-latest",
       "vram_bytes": 26644033043,
       "ctx_len": 262144,
       "priority": 100
     },
     {
-      "name": "takacsai",
+      "name": "takacsai-latest",
       "vram_bytes": 28780779272,
       "ctx_len": 262144,
       "priority": 90
     },
     {
-      "name": "qwen3.6",
+      "name": "qwen3.6-35b",
       "vram_bytes": 25962206984,
       "ctx_len": 131072,
       "priority": 20
     },
     {
-      "name": "ornith",
+      "name": "qwen3.6-27b",
+      "vram_bytes": 25040110222,
+      "ctx_len": 131072,
+      "priority": 20
+    },
+    {
+      "name": "ornith-35b",
       "vram_bytes": 23825460755,
       "ctx_len": 131072,
       "priority": 20
     },
     {
-      "name": "gemma4",
+      "name": "gemma4-e4b",
       "vram_bytes": 3453610883,
       "ctx_len": 131072,
       "priority": 20
     },
     {
-      "name": "qwen2.5-coder",
+      "name": "qwen2.5-coder-1.5b-base",
       "vram_bytes": 3251361546,
       "ctx_len": 131072,
       "priority": 20
