@@ -14,32 +14,32 @@
     },
     {
       "name": "qwen3.6-35b",
-      "vram_bytes": 25962206984,
-      "ctx_len": 131072,
-      "priority": 20
-    },
-    {
-      "name": "qwen3.6-27b",
-      "vram_bytes": 25040110222,
-      "ctx_len": 131072,
+      "vram_bytes": 23848277768,
+      "ctx_len": 32768,
       "priority": 20
     },
     {
       "name": "ornith-35b",
-      "vram_bytes": 23825460755,
-      "ctx_len": 131072,
+      "vram_bytes": 21816399625,
+      "ctx_len": 32768,
+      "priority": 20
+    },
+    {
+      "name": "qwen3.6-27b",
+      "vram_bytes": 18658487172,
+      "ctx_len": 32768,
       "priority": 20
     },
     {
       "name": "gemma4-e4b",
-      "vram_bytes": 3453610883,
-      "ctx_len": 131072,
+      "vram_bytes": 3906648144,
+      "ctx_len": 32768,
       "priority": 20
     },
     {
       "name": "qwen2.5-coder-1.5b-base",
       "vram_bytes": 3251361546,
-      "ctx_len": 131072,
+      "ctx_len": 32768,
       "priority": 20
     }
   ]

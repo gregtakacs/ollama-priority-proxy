@@ -28,6 +28,9 @@ Usage:
     # Force recalculation of all models:
     python measure_models.py -a --force --output measured_vram.json
 
+    # Measure using Ollama's model-specific default context (recommended for accurate VRAM):
+    python measure_models.py -a --use-default-ctx --output measured_vram.json
+
     # Remove stale entries for deleted models:
     python measure_models.py --cleanup --output measured_vram.json
 
@@ -305,7 +308,7 @@ def model_name_to_key(name):
 # Core Measurement
 # ---------------------------------------------------------------------------
 
-def measure_model(model_name):
+def measure_model(model_name, use_default_ctx=False):
     """Measure VRAM usage for a model at its native context length.
 
     Uses /api/show to get the model's designed context_length, then measures
@@ -314,6 +317,10 @@ def measure_model(model_name):
 
     Args:
         model_name: Full model name with tag (e.g., 'TakacsAI-Coder-256k:latest')
+        use_default_ctx: When True, omit num_ctx from the API request so Ollama
+            uses its model-specific default context length. This matches real-world
+            usage via WebUI or CLI and gives more accurate VRAM measurements for
+            models where forcing 128k+ causes over-allocation.
 
     Returns:
         Tuple of (vram_bytes, ctx_len) on success, or (None, None) on failure.
@@ -323,38 +330,51 @@ def measure_model(model_name):
     if native_ctx and native_ctx > 0:
         print(f"  Native context_length: {native_ctx:,} tokens")
 
-    # Step 2: Try measuring at native ctx, then fall back to smaller contexts
-    ctxs_to_try = []
-    if native_ctx and native_ctx > 0:
-        ctxs_to_try.append(native_ctx)
-    # Always include the standard fallback chain (in case native is too large or unknown)
-    for fb in CTX_FALLBACKS:
-        if fb not in ctxs_to_try:
-            ctxs_to_try.append(fb)
+    if use_default_ctx:
+        # Use Ollama's default — omit num_ctx entirely so it uses the model-specific default.
+        ctxs_to_try = [None]
+    else:
+        # Step 2: Try measuring at native ctx, then fall back to smaller contexts
+        ctxs_to_try = []
+        if native_ctx and native_ctx > 0:
+            ctxs_to_try.append(native_ctx)
+        # Always include the standard fallback chain (in case native is too large or unknown)
+        for fb in CTX_FALLBACKS:
+            if fb not in ctxs_to_try:
+                ctxs_to_try.append(fb)
 
     last_result = None
     for try_ctx in ctxs_to_try:
         print(f"\n{'='*60}")
-        print(f"Measuring: {model_name} @ ctx={try_ctx:,} (attempt)")
+        if try_ctx is None:
+            print(f"Measuring: {model_name} @ DEFAULT (Ollama's native default)")
+        else:
+            print(f"Measuring: {model_name} @ ctx={try_ctx:,} (attempt)")
         print(f"{'='*60}")
 
         # Step 1: Trigger model load via generate API with keep_alive=-1
         # keep_alive=-1 prevents Ollama from auto-evicting the loaded model
         # when subsequent models are measured in a batch run.
-        print(f"[1/3] Loading '{model_name}' with num_ctx={try_ctx:,}...")
+        if try_ctx is None:
+            print(f"[1/3] Loading '{model_name}' (default context)...")
+            options = {}  # No num_ctx — let Ollama use its default
+        else:
+            print(f"[1/3] Loading '{model_name}' with num_ctx={try_ctx:,}...")
+            options = {"num_ctx": try_ctx}
+
         data = _make_request(
             f"{TARGET_HOST}/api/generate",
             data=json.dumps({
                 "model": model_name,
                 "prompt": "test",
                 "stream": False,
-                "options": {"num_ctx": try_ctx},
+                "options": options,
                 "keep_alive": -1
             }).encode()
         )
 
         if not data:
-            print(f"  ✗ Failed to load at ctx={try_ctx:,} (API error). Trying next...")
+            print(f"  ✗ Failed to load (API error). Trying next...")
             last_result = None
             continue
 
@@ -371,27 +391,42 @@ def measure_model(model_name):
             continue
 
         # Ollama's /api/ps reports size_vram (total VRAM including KV cache) but NOT ctx_len.
-        # The ctx we used IS what was actually configured for this measurement.
+        # When use_default_ctx=True, the actual context is reported in ps_data as "context_length".
         matched = False
         for m in ps_data["models"]:
             if model_name in m.get("name", "") or m.get("digest", "") == data.get("model_digest", ""):
                 size = int(m.get("size_vram", 0))
+
+                # Determine the actual context length used (from API if available)
+                if try_ctx is None and "context_length" in m:
+                    actual_ctx = m["context_length"]
+                    ctx_reported = f"{actual_ctx:,} (from /api/ps)"
+                elif try_ctx is not None:
+                    actual_ctx = try_ctx
+                    ctx_reported = f"{try_ctx:,}"
+                else:
+                    actual_ctx = native_ctx or 0
+                    ctx_reported = "?"
+
                 print(f"  ✓ Total VRAM (incl. KV cache): {size / 1e9:.2f} GB ({size:,} bytes)")
-                print(f"  ✓ Context length used: {try_ctx:,}")
-                last_result = (size, try_ctx)
+                print(f"  ✓ Context length used: {ctx_reported}")
+                last_result = (size, actual_ctx)
 
                 # If this was the native ctx, we're done — no need to fall back further.
-                if try_ctx == native_ctx:
+                if try_ctx == native_ctx and native_ctx is not None:
                     return size, try_ctx
                 matched = True
                 break
 
         if not matched and last_result is None:
-            print(f"  ✗ Model evicted before measurement at ctx={try_ctx:,}. Trying next...")
+            print(f"  ✗ Model evicted before measurement at ctx={try_ctx or 'default'}. Trying next...")
         elif last_result is not None:
-            # Successfully measured at a fallback ctx — report it but don't try further.
-            print(f"  ✓ Measured at fallback ctx={try_ctx:,} (native was {native_ctx or '?'})")
-            return size, try_ctx
+            # Successfully measured — report it but don't try further.
+            if use_default_ctx:
+                print(f"  ✓ Measured at Ollama default context (ctx_len={m['context_length']})")
+            else:
+                print(f"  ✓ Measured at fallback ctx={try_ctx:,} (native was {native_ctx or '?'})")
+            return size, actual_ctx
 
     # All attempts exhausted
     if last_result is None:
@@ -441,7 +476,7 @@ def cleanup_mode(config_path):
     save_config(unified, config_path)
 
 
-def benchmark_all_mode(config_path, force_recalc=False):
+def benchmark_all_mode(config_path, force_recalc=False, use_default_ctx=False):
     """Benchmark every local Ollama model at its native context length.
 
     By default only measures models NOT already in the config file.
@@ -485,7 +520,7 @@ def benchmark_all_mode(config_path, force_recalc=False):
         print(f"# Measuring: {model_name}{native_info} (key: '{key}')")
         print(f"{'#'*60}")
 
-        result = measure_model(model_name)
+        result = measure_model(model_name, use_default_ctx=use_default_ctx)
         if result and len(result) == 2 and result[0] is not None:
             size, ctx_len = result
             # Track whether this model was measured at fallback ctx (no native defined)
@@ -542,13 +577,16 @@ def main():
                         help="Config file path (default: ollama_model_registry.json)")
     parser.add_argument("-f", "--force", action="store_true",
                         help="Force recalculation of ALL models (use with --all)")
+    parser.add_argument("--use-default-ctx", dest="use_default_ctx", action="store_true",
+                        help="Use Ollama's model-specific default context length instead of forcing 128k. "
+                             "Recommended for accurate VRAM measurement matching real-world usage via WebUI/CLI.")
 
     args = parser.parse_args()
 
     config_path = args.output or "ollama_model_registry.json"
 
     if args.benchmark_all:
-        benchmark_all_mode(config_path, force_recalc=args.force)
+        benchmark_all_mode(config_path, force_recalc=args.force, use_default_ctx=args.use_default_ctx)
     elif args.cleanup:
         cleanup_mode(config_path)
 
